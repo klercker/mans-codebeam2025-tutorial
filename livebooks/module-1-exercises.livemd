@@ -1,5 +1,7 @@
 # Thinking in Processes - Exercises
 
+## Section
+
 ```elixir
 Mix.install([{:kino, "~> 0.17.0"}])
 ```
@@ -15,6 +17,457 @@ Welcome to the hands-on exercises for Thinking in Processes!
 
 Each section has runnable code cells. Execute them, experiment, and observe what happens!
 
+## Per-Process GC and Isolation
+
+### Exercise 1: Per-Process Garbage Collection
+
+**Goal:** Observe how per-process GC allows independent memory management without global pauses
+
+##### Task 1.1: Create Processes with Different Memory Profiles
+
+```erlang
+% Worker that allocates and holds large data
+LargeHeapWorker = fun Loop(Data) ->
+    receive
+        {add_data, Size} ->
+            NewData = [lists:duplicate(Size, 0) | Data],
+            io:format("Worker heap now holds ~p items~n", [length(NewData)]),
+            Loop(NewData);
+        {gc_stats, From} ->
+            GCInfo = process_info(self(), [garbage_collection, memory]),
+            From ! {gc_stats, GCInfo},
+            Loop(Data)
+    end
+end,
+
+% Small, fast worker
+FastWorker = fun Loop(Count) ->
+    receive
+        tick ->
+            Loop(Count + 1);
+        {count, From} ->
+            From ! {count, Count},
+            Loop(Count)
+    end
+end,
+
+Heavy = spawn(fun() -> LargeHeapWorker([]) end),
+register(heavy, Heavy),
+Fast = spawn(fun() -> FastWorker(0) end),
+register(fast, Fast).
+```
+
+##### Task 1.2: Trigger GC on One Process
+
+```erlang
+% Load the heavy worker with data
+[heavy ! {add_data, 10000} || _ <- lists:seq(1, 10)],
+
+% Fast worker keeps ticking
+[fast ! tick || _ <- lists:seq(1, 1000)],
+
+% Force GC on heavy worker only
+erlang:garbage_collect(Heavy),
+
+% Check both processes
+heavy ! {gc_stats, self()},
+HeavyStats = receive {gc_stats, H} -> H after 1000 -> timeout end,
+
+fast ! {count, self()},
+FastCount = receive {count, C} -> C after 1000 -> timeout end,
+
+io:format("Heavy worker GC stats: ~p~n", [HeavyStats]),
+io:format("Fast worker processed: ~p ticks~n", [FastCount]).
+```
+
+**Observe:** The heavy worker's GC runs independently. The fast worker never pauses. Compare this to stop-the-world GC in shared-heap systems.
+
+**Discussion:** In a payment processing system with 10,000 connection processes and 5 large aggregator processes, how does per-process GC prevent GC pauses from affecting latency-sensitive connections?
+
+## OOP State Sharing vs Process Isolation
+
+### Exercise 2: Shared State Corruption (OOP) vs Message Passing (BEAM)
+
+**Goal:** Demonstrate the fundamental architectural difference between shared mutable state and isolated processes
+
+##### Task 2.1: Simulate Shared State Problems
+
+In the BEAM, we have to simulate what shared state corruption looks like:
+
+```erlang
+% Scenario: Counter with race condition (simulated)
+% In OOP: Multiple threads increment shared counter
+% Problem: Read-modify-write race
+
+SharedCounterSimulation = fun() ->
+    % Process simulates shared memory with race condition
+    Counter = ets:new(counter, [public, set]),
+    ets:insert(Counter, {value, 0}),
+
+    % Multiple "threads" trying to increment
+    IncrementRace = fun() ->
+        % Read
+        [{value, Current}] = ets:lookup(Counter, value),
+        % Simulate time between read and write
+        timer:sleep(1),
+        % Write
+        ets:insert(Counter, {value, Current + 1})
+    end,
+
+    % Spawn 10 concurrent "threads"
+    Pids = [spawn(IncrementRace) || _ <- lists:seq(1, 10)],
+
+    % Wait for all to finish
+    timer:sleep(50),
+
+    [{value, Final}] = ets:lookup(Counter, value),
+    io:format("Expected: 10, Got: ~p (race condition!)~n", [Final]),
+    ets:delete(Counter)
+end,
+
+SharedCounterSimulation().
+```
+
+##### Task 2.2: BEAM Process Isolation Solution
+
+```erlang
+% Counter as isolated process
+CounterProcess = fun Loop(Count) ->
+    receive
+        {increment, From} ->
+            NewCount = Count + 1,
+            From ! {ok, NewCount},
+            Loop(NewCount);
+        {get, From} ->
+            From ! {value, Count},
+            Loop(Count);
+        stop -> ok
+    end
+end,
+
+Counter = spawn(fun() -> CounterProcess(0) end),
+register(counter, Counter),
+
+% Multiple processes send increment messages
+[spawn(fun() ->
+    counter ! {increment, self()},
+    receive {ok, _} -> ok after 1000 -> timeout end
+end) || _ <- lists:seq(1, 10)],
+
+timer:sleep(50),
+
+% Get final value
+counter ! {get, self()},
+FinalValue = receive {value, V} -> V after 1000 -> timeout end,
+
+io:format("Expected: 10, Got: ~p (no race!)~n", [FinalValue]).
+```
+
+**Observe:** Process isolation eliminates race conditions. The counter serializes all updates through its mailbox.
+
+**Discussion:** In OOP, you'd use locks (mutexes, semaphores). What are the costs? Deadlocks? Contention? How does BEAM's message-passing model trade performance for correctness and simplicity?
+
+## Scheduler Behavior and Reductions
+
+### Exercise 3: Reduction-Based Preemption
+
+**Goal:** Understand how the BEAM scheduler ensures fairness through reduction counting
+
+##### Task 3.1: Long-Running Computation
+
+```erlang
+% Function that consumes many reductions
+BusyWork = fun Loop(0) -> done;
+              Loop(N) -> Loop(N - 1)
+           end,
+
+% Spawn process that does heavy computation
+ComputeWorker = fun() ->
+    Start = erlang:system_time(microsecond),
+    process_flag(priority, normal),
+    InitialReductions = element(2, process_info(self(), reductions)),
+
+    % Do expensive work
+    BusyWork(1000000),
+
+    FinalReductions = element(2, process_info(self(), reductions)),
+    End = erlang:system_time(microsecond),
+    Duration = End - Start,
+
+    io:format("Consumed ~p reductions in ~p μs~n",
+              [FinalReductions - InitialReductions, Duration])
+end,
+
+Pid1 = spawn(ComputeWorker),
+Pid2 = spawn(ComputeWorker),
+Pid3 = spawn(ComputeWorker).
+```
+
+##### Task 3.2: Observe Scheduler Preemption
+
+```erlang
+% Create a long-running process that logs when it runs
+PreemptionTest = fun Loop(Segment) ->
+    case Segment > 10 of
+        true -> done;
+        false ->
+            % Each segment does work
+            lists:seq(1, 100000),
+            io:format("Segment ~p completed by ~p~n", [Segment, self()]),
+            Loop(Segment + 1)
+    end
+end,
+
+% Spawn multiple competing processes
+[spawn(fun() -> PreemptionTest(1) end) || _ <- lists:seq(1, 4)],
+
+% Watch them interleave output
+timer:sleep(1000).
+```
+
+**Observe:** Even though each process wants to run continuously, the scheduler preempts them. Output from different processes interleaves, showing fair time-slicing.
+
+##### Task 3.3: Process Priority Impact
+
+```erlang
+LowPriorityWork = fun() ->
+    process_flag(priority, low),
+    Start = erlang:system_time(millisecond),
+    lists:seq(1, 1000000),
+    End = erlang:system_time(millisecond),
+    io:format("Low priority finished in ~p ms~n", [End - Start])
+end,
+
+HighPriorityWork = fun() ->
+    process_flag(priority, high),
+    Start = erlang:system_time(millisecond),
+    lists:seq(1, 1000000),
+    End = erlang:system_time(millisecond),
+    io:format("High priority finished in ~p ms~n", [End - Start])
+end,
+
+spawn(LowPriorityWork),
+timer:sleep(1),
+spawn(HighPriorityWork).
+```
+
+**Observe:** High priority process typically finishes faster. Scheduler gives it more frequent time slices.
+
+**Discussion:** Why does BEAM use reduction-based scheduling instead of time-based? What happens with a process that does mostly message passing vs computation?
+
+## Isolation Cost Analysis
+
+### Exercise 4: Measuring the Cost of Isolation
+
+**Goal:** Quantify the trade-off between isolation (safety) and performance (copying)
+
+##### Task 4.1: Compare Shared vs Copied Data
+
+```erlang
+% Simulate "shared memory" using ETS (closest we can get)
+SharedTable = ets:new(shared, [public, set]),
+ets:insert(SharedTable, {data, lists:seq(1, 1000)}),
+
+% Time ETS lookup (simulated shared access)
+ETSTime = fun() ->
+    {Time, _} = timer:tc(fun() ->
+        [ets:lookup(SharedTable, data) || _ <- lists:seq(1, 10000)]
+    end),
+    Time
+end,
+
+ETSMicros = ETSTime(),
+io:format("ETS 'shared' access: ~p μs for 10k lookups~n", [ETSMicros]),
+
+% Time message passing (BEAM isolation via copying)
+Worker = spawn(fun Loop() ->
+    receive
+        {request, From} ->
+            From ! {data, lists:seq(1, 1000)},
+            Loop();
+        stop -> ok
+    end
+end),
+
+MessageTime = fun() ->
+    {Time, _} = timer:tc(fun() ->
+        [begin
+            Worker ! {request, self()},
+            receive {data, _} -> ok after 1000 -> timeout end
+        end || _ <- lists:seq(1, 10000)]
+    end),
+    Time
+end,
+
+MsgMicros = MessageTime(),
+io:format("Message passing: ~p μs for 10k round-trips~n", [MsgMicros]),
+io:format("Isolation cost: ~.2fx slower~n", [MsgMicros / ETSMicros]),
+
+Worker ! stop.
+```
+
+**Observe:** Message passing has measurable overhead due to copying. But you get isolation and fault tolerance.
+
+##### Task 4.2: Isolation Prevents Corruption
+
+```erlang
+% Demonstrate immutability across process boundaries
+Original = [1, 2, 3],
+
+Receiver = spawn(fun() ->
+    receive
+        {data, List} ->
+            % Receiver modifies its copy
+            Modified = [99 | List],
+            io:format("Receiver sees: ~p~n", [Modified])
+    end
+end),
+
+Receiver ! {data, Original},
+timer:sleep(10),
+
+io:format("Sender still has: ~p~n", [Original]).
+```
+
+**Observe:** Sender's data unchanged. Each process has its own copy. No possibility of shared mutation bugs.
+
+**Discussion:** WhatsApp handles billions of messages daily with this architecture. When is the isolation cost worth paying? When might you use ETS for shared read-mostly data?
+
+## OOP vs Gnome Architecture
+
+### Exercise 5: Redesigning an OOP System for BEAM
+
+**Goal:** Practice converting shared-state OOP thinking to process-oriented architecture
+
+##### Scenario: Order Processing System
+
+**OOP Design (typical Java/C# approach):**
+
+```text
+class OrderProcessor {
+  private Map<OrderId, Order> orders;  // Shared state
+  private Lock lock;                    // Synchronization
+
+  synchronized void processOrder(Order order) {
+    lock.acquire();
+    orders.put(order.id, order);
+    order.validate();
+    order.charge();
+    order.ship();
+    lock.release();
+  }
+}
+
+// Multiple threads call processOrder()
+// Problem: Lock contention, possible deadlocks, complex error handling
+```
+
+##### Task 5.1: Design as Process Architecture
+
+Sketch a BEAM process architecture for this system. Consider:
+
+1. **What are the processes?** (Draw process boxes)
+
+* Order process per order?
+* Pool of order workers?
+* Payment service process?
+* Shipping service process?
+* Supervisor structure?
+
+1. **What are the messages?** (Define message protocols)
+
+   ```erlang
+   % Example message types:
+   {create_order, OrderId, Items}
+   {validate, OrderId}
+   {payment_completed, OrderId, Receipt}
+   {ship_order, OrderId, Address}
+   ```
+
+2. **Where is state?** (Which processes hold what state?)
+
+* Order state in order process?
+* Payment state in payment service?
+* Global order index in registry?
+
+##### Task 5.2: Implement Mini Order Process
+
+```erlang
+OrderProcess = fun Loop(State) ->
+    #{order_id := Id, status := Status, items := Items} = State,
+    receive
+        {validate, From} ->
+            % Validation logic
+            NewState = State#{status => validated},
+            From ! {validated, Id},
+            Loop(NewState);
+
+        {payment, Amount, From} ->
+            case Status of
+                validated ->
+                    % Process payment
+                    NewState = State#{status => paid, paid_amount => Amount},
+                    From ! {payment_success, Id},
+                    Loop(NewState);
+                _ ->
+                    From ! {payment_failed, Id, invalid_status},
+                    Loop(State)
+            end;
+
+        {ship, Address, From} ->
+            case Status of
+                paid ->
+                    % Initiate shipping
+                    NewState = State#{status => shipped, address => Address},
+                    From ! {shipped, Id},
+                    io:format("Order ~p shipped~n", [Id]),
+                    % Process exits when complete
+                    ok;
+                _ ->
+                    From ! {ship_failed, Id, invalid_status},
+                    Loop(State)
+            end;
+
+        {status, From} ->
+            From ! {status, Id, Status},
+            Loop(State)
+    end
+end,
+
+% Create an order
+OrderState = #{
+    order_id => order_123,
+    status => pending,
+    items => [{item_a, 2}, {item_b, 1}]
+},
+
+Order = spawn(fun() -> OrderProcess(OrderState) end),
+register(order_123, Order).
+```
+
+##### Task 5.3: Test the Process
+
+```erlang
+% Validate
+order_123 ! {validate, self()},
+receive {validated, _} -> io:format("Validated~n") after 1000 -> timeout end,
+
+% Pay
+order_123 ! {payment, 99.99, self()},
+receive {payment_success, _} -> io:format("Paid~n") after 1000 -> timeout end,
+
+% Ship
+order_123 ! {ship, <<"123 Main St">>, self()},
+receive {shipped, _} -> io:format("Shipped~n") after 1000 -> timeout end.
+```
+
+**Discussion:**
+
+* How does this architecture handle concurrent orders? (Spoiler: trivially, each is isolated)
+* What if payment processing crashes? (Order process waits, times out, or gets notified)
+* How do you monitor order progress? (Send status messages to order processes)
+* Where would you add a supervisor? (Above orders, payment service, shipping service)
+* How is this different from locking shared OrderProcessor state?
 
 ## Module 1 Review
 
@@ -115,4 +568,3 @@ What is the key architectural difference between the "machine park" and "gnome v
 ```elixir
 Quiz.render_from_file(__DIR__ <> "/module-1-exercises.livemd", quiz: 1)
 ```
-

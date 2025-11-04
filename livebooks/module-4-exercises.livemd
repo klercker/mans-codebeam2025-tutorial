@@ -1,7 +1,5 @@
 # Module 4 – Scheduling & Concurrency - Exercises
 
-## Section
-
 ```elixir
 Mix.install([{:kino, "~> 0.17.0"}])
 ```
@@ -428,6 +426,7 @@ end.
 
 **Discussion:** When should you manually yield? What's the cost? How does this affect system responsiveness?
 
+
 ## Module 4 Review
 
 <!--
@@ -527,3 +526,4 @@ What operations automatically yield control before exhausting reductions?
 ```elixir
 Quiz.render_from_file(__DIR__ <> "/module-4-exercises.livemd", quiz: 1)
 ```
+
